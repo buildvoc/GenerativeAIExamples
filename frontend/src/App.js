@@ -32,6 +32,8 @@ function App() {
   const [isTyping, setIsTyping] = useState(false);
   const [useRag, setUseRag] = useState(true);
   const [usePictures, setUsePictures] = useState(true);
+  const [collection, setCollection] = useState('test_02');
+  const [collections, setCollections] = useState([]);
   const [expandedRefs, setExpandedRefs] = useState({});
   const [appConfig, setAppConfig] = useState(null);
   const [pictureSearchQuery, setPictureSearchQuery] = useState('');
@@ -87,6 +89,18 @@ function App() {
       setServerIp("192.168.1.178");
     }
   }, [serverIp]);
+
+  useEffect(() => {
+    const baseUrl = appConfig?.api?.base_url || "http://192.168.1.178:8001";
+    fetch(`${baseUrl}/api/collections`)
+      .then((r) => r.json())
+      .then((d) => {
+        const list = Array.isArray(d.collections) ? d.collections : [];
+        setCollections(list);
+        if (list.length && !list.includes(collection)) setCollection(list[0]);
+      })
+      .catch(() => {});
+  }, [appConfig, collection]);
 
   // Auto-dismiss error after 5 seconds
   useEffect(() => {
@@ -169,7 +183,7 @@ function App() {
             : {})
         },
         body: JSON.stringify({
-          model: appConfig?.llm?.model?.name || "nvidia/Llama-3.1-Nemotron-Nano-4B-v1.1",
+          model: appConfig?.llm?.model?.name || "gemma3:4b-it-q4_K_M",
           messages: [
             {
               role: "system",
@@ -178,7 +192,7 @@ function App() {
             ...summaryMessages
           ],
           stream: false,
-          max_tokens: 256
+          max_tokens: 128
         }),
       });
 
@@ -210,7 +224,8 @@ function App() {
         body: JSON.stringify({ 
           query,
           use_rag: true,
-          k: appConfig?.ui?.components?.search?.default_k || 5
+          k: appConfig?.ui?.components?.search?.default_k || 5,
+          collection
         }),
       });
 
@@ -937,6 +952,7 @@ function App() {
         query: cleanQuery,
         use_rag: true,
         k,
+        collection,
       }),
     });
 
@@ -1114,7 +1130,7 @@ function App() {
           model: appConfig?.llm?.model?.name || 'nvidia/Llama-3.1-Nemotron-Nano-4B-v1.1',
           messages: contextMessages,
           stream: false,
-          max_tokens: 256,
+          max_tokens: 128,
           temperature: appConfig?.llm?.model?.temperature || 0.6,
           top_p: appConfig?.llm?.model?.top_p || 0.95,
         }),
@@ -1136,7 +1152,6 @@ function App() {
         role: 'assistant',
         content: messageContent,
         references: useRag ? JSON.stringify(relevantResults) : '',
-        showThinking: detailedThinking,
         query: message,
       };
 
@@ -1215,8 +1230,7 @@ function App() {
             ? 'The LLM server is not accessible at the moment. Please check if the server is running and try again.'
             : 'Sorry, there was an error processing your request. Please try again.',
           references: '',
-          showThinking: detailedThinking,
-        },
+          },
       ]);
     } finally {
       setIsLoading(false);
@@ -1235,8 +1249,9 @@ function App() {
 
   const clearRAG = async () => {
     try {
+      const baseUrl = appConfig?.api?.base_url || "http://192.168.1.178:8001";
       // Get current RAG status
-      const statusResponse = await fetch(`/api/rag-status`);
+      const statusResponse = await fetch(`${baseUrl}/api/rag-status?collection=${encodeURIComponent(collection)}`);
       const statusData = await statusResponse.json();
       
       // If RAG is empty, just notify the user
@@ -1252,7 +1267,7 @@ function App() {
       }
       
       // Clear the RAG index on the backend
-      const response = await fetch(`/api/clear-rag`, {
+      const response = await fetch(`${baseUrl}/api/clear-rag?collection=${encodeURIComponent(collection)}`, {
         method: 'POST',
       });
 
@@ -1263,7 +1278,7 @@ function App() {
       const data = await response.json();
       // Don't clear messages array - preserve chat history and context
       
-      alert(`Successfully cleared RAG index. Deleted ${data.deleted_chunks} chunks and ${data.deleted_documents} documents.`);
+      alert(`Successfully cleared RAG collection ${collection}.`);
     } catch (error) {
       console.error('Error clearing RAG:', error);
       alert('Failed to clear RAG index. Please check if the RAG server is running on port 8001.');
@@ -1410,7 +1425,7 @@ function App() {
     const thinkingRegex = /<(?:think|thinking|reasoning)>([\s\S]*?)<\/(?:think|thinking|reasoning)>/g;
     const parts = message.content.split(thinkingRegex);
     const hasThinkingContent = parts.length > 1;
-    const shouldShowThinking = message.showThinking !== undefined ? message.showThinking : detailedThinking;
+    const shouldShowThinking = detailedThinking;
 
     const content = parts.map((part, i) => {
       if (i % 2 === 1) {
@@ -1579,6 +1594,19 @@ function App() {
           </div>
 
           <div className="rag-toggle">
+            <span className="toggle-label">Collection</span>
+            <select
+              value={collection}
+              onChange={(e) => setCollection(e.target.value)}
+              style={{ marginLeft: '0.5rem', padding: '0.35rem' }}
+            >
+              {(collections.length ? collections : [collection]).map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="rag-toggle">
             <label className="switch">
               <input
                 type="checkbox"
@@ -1620,7 +1648,7 @@ function App() {
 
       <main className="chat-container">
         {view === 'knowledge' ? (
-          <ProjectKnowledge usePictures={usePictures} />
+          <ProjectKnowledge usePictures={usePictures} collection={collection} />
         ) : view === 'pictureAnnotations' ? (
           <PictureAnnotations />
         ) : (
