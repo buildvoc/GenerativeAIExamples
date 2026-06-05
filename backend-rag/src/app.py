@@ -26,6 +26,9 @@ import PyPDF2
 import io
 import logging
 import json
+import base64
+import requests
+from PIL import Image
 from fastapi.responses import StreamingResponse, FileResponse
 from queue import Queue
 import threading
@@ -611,6 +614,187 @@ async def get_document(file_id: str):
     except Exception as e:
         logger.error(f"Error serving document {file_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error serving document: {str(e)}")
+
+
+# -----------------------------
+# ADDED: picture-aware Docling endpoints
+# -----------------------------
+class PicturesRequest(BaseModel):
+    query: Optional[str] = ""
+    source_file: Optional[str] = None
+    k: Optional[int] = 10
+    limit: Optional[int] = 20
+
+class DescribePicturesRequest(BaseModel):
+    query: Optional[str] = ""
+    source_file: Optional[str] = None
+    k: Optional[int] = 10
+    limit: Optional[int] = 10
+    model: Optional[str] = "gemma4:e4b"
+    ollama_url: Optional[str] = "http://localhost:11434"
+
+def load_stored_json(source_file: str) -> Dict[str, Any]:
+    file_path = os.path.join(STORAGE_DIR, source_file)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail=f"Document not found: {source_file}")
+    with open(file_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def discover_source_file(query: str, k: int = 10) -> str:
+    results = rag_service.search(query, k)
+    for r in results:
+        sf = str(r.get("source_file", "")).strip()
+        if sf.endswith(".json"):
+            return sf
+    raise HTTPException(status_code=404, detail="No JSON source_file found from RAG search")
+
+def text_by_ref(doc: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        t.get("self_ref"): (t.get("text") or t.get("orig") or "")
+        for t in doc.get("texts", [])
+        if isinstance(t, dict) and t.get("self_ref")
+    }
+
+def picture_caption_texts(doc: Dict[str, Any], pic: Dict[str, Any]) -> List[str]:
+    refs = text_by_ref(doc)
+    out = []
+    for c in pic.get("captions", []) or []:
+        if isinstance(c, dict):
+            ref = c.get("$ref") or c.get("ref")
+            if ref and refs.get(ref):
+                out.append(refs[ref])
+            elif c.get("text"):
+                out.append(c["text"])
+        elif isinstance(c, str):
+            out.append(refs.get(c, c))
+    return [x.strip() for x in out if x and x.strip()]
+
+def picture_annotation_texts(pic: Dict[str, Any]) -> List[str]:
+    out = []
+    for a in pic.get("annotations", []) or []:
+        if isinstance(a, dict) and a.get("kind") == "description" and a.get("text"):
+            out.append(a["text"].strip())
+    return out
+
+def picture_page_no(pic: Dict[str, Any]) -> Optional[int]:
+    prov = pic.get("prov") or []
+    if prov and isinstance(prov[0], dict):
+        pn = prov[0].get("page_no")
+        return pn if isinstance(pn, int) else None
+    return None
+
+def picture_bbox(pic: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    prov = pic.get("prov") or []
+    if prov and isinstance(prov[0], dict) and isinstance(prov[0].get("bbox"), dict):
+        return prov[0]["bbox"]
+    return None
+
+def picture_record(doc: Dict[str, Any], source_file: str, pic: Dict[str, Any], idx: int) -> Dict[str, Any]:
+    page_no = picture_page_no(pic)
+    page = (doc.get("pages") or {}).get(str(page_no), {}) if page_no else {}
+    img = page.get("image") or {}
+    return {
+        "source_file": source_file,
+        "picture_index": idx,
+        "picture_ref": pic.get("self_ref"),
+        "page_no": page_no,
+        "picture_class": (pic.get("meta") or {}).get("picture_classification"),
+        "caption": "\n".join(picture_caption_texts(doc, pic)),
+        "docling_description": "\n".join(picture_annotation_texts(pic)),
+        "bbox": picture_bbox(pic),
+        "page_image_mimetype": img.get("mimetype") if isinstance(img, dict) else None,
+        "page_image_uri_len": len(img.get("uri", "")) if isinstance(img, dict) else 0,
+    }
+
+def matches_picture_query(rec: Dict[str, Any], query: str) -> bool:
+    q = (query or "").strip().lower()
+    if not q:
+        return True
+    hay = " ".join(str(rec.get(k, "")) for k in ("picture_class", "caption", "docling_description")).lower()
+    return all(term in hay for term in q.split())
+
+def crop_picture_data_url(doc: Dict[str, Any], pic: Dict[str, Any]) -> Optional[str]:
+    page_no = picture_page_no(pic)
+    bbox = picture_bbox(pic)
+    if not page_no or not bbox:
+        return None
+
+    page = (doc.get("pages") or {}).get(str(page_no), {})
+    img_meta = page.get("image") or {}
+    uri = img_meta.get("uri", "") if isinstance(img_meta, dict) else ""
+    if not uri.startswith("data:image/png;base64,"):
+        return None
+
+    raw = base64.b64decode(uri.split(",", 1)[1])
+    img = Image.open(io.BytesIO(raw))
+
+    pdf_size = page.get("size") or {}
+    pdfw, pdfh = float(pdf_size.get("width", 0)), float(pdf_size.get("height", 0))
+    if not pdfw or not pdfh:
+        return None
+
+    pxw, pxh = img.size
+    l, t, r, b = [float(bbox.get(k, 0)) for k in ("l", "t", "r", "b")]
+
+    x0 = round((l / pdfw) * pxw)
+    x1 = round((r / pdfw) * pxw)
+    y0 = round(((pdfh - t) / pdfh) * pxh)
+    y1 = round(((pdfh - b) / pdfh) * pxh)
+
+    x0, x1 = sorted((max(0, x0 - 2), min(pxw, x1 + 2)))
+    y0, y1 = sorted((max(0, y0 - 2), min(pxh, y1 + 2)))
+
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return None
+
+    crop = img.crop((x0, y0, x1, y1))
+    buf = io.BytesIO()
+    crop.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
+
+def describe_with_ollama(data_url: str, model: str, ollama_url: str) -> str:
+    img64 = data_url.split(",", 1)[1]
+    prompt = (
+        "Describe this cropped PDF picture factually. Include visible text. "
+        "Do not invent names, dates, or locations. If unclear, say unclear."
+    )
+    resp = requests.post(
+        f"{ollama_url.rstrip('/')}/api/generate",
+        json={"model": model, "prompt": prompt, "images": [img64], "stream": False},
+        timeout=300,
+    )
+    resp.raise_for_status()
+    return (resp.json().get("response") or "").strip()
+
+@app.post("/api/pictures")
+async def list_pictures(request: PicturesRequest):
+    source_file = request.source_file or discover_source_file(request.query or "", request.k or 10)
+    doc = load_stored_json(source_file)
+    results = []
+    for i, pic in enumerate(doc.get("pictures", []) or [], 1):
+        rec = picture_record(doc, source_file, pic, i)
+        if matches_picture_query(rec, request.query or ""):
+            results.append(rec)
+        if len(results) >= (request.limit or 20):
+            break
+    return {"source_file": source_file, "results": results}
+
+@app.post("/api/describe-pictures")
+async def describe_pictures(request: DescribePicturesRequest):
+    source_file = request.source_file or discover_source_file(request.query or "", request.k or 10)
+    doc = load_stored_json(source_file)
+    results = []
+    for i, pic in enumerate(doc.get("pictures", []) or [], 1):
+        rec = picture_record(doc, source_file, pic, i)
+        if not matches_picture_query(rec, request.query or ""):
+            continue
+        crop = crop_picture_data_url(doc, pic)
+        rec["crop_available"] = bool(crop)
+        rec["gemma4_description"] = describe_with_ollama(crop, request.model or "gemma4:e4b", request.ollama_url or "http://localhost:11434") if crop else ""
+        results.append(rec)
+        if len(results) >= (request.limit or 10):
+            break
+    return {"source_file": source_file, "model": request.model, "results": results}
 
 if __name__ == "__main__":
     import uvicorn
